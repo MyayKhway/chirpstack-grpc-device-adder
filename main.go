@@ -130,7 +130,19 @@ func initialModel() model {
 	// Initialize file picker
 	fp := filepicker.New()
 	fp.AllowedTypes = []string{".csv"}
-	fp.CurrentDirectory, _ = os.UserHomeDir()
+
+	// Set current directory with error handling
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to current directory if home directory fails
+		if cwd, err := os.Getwd(); err == nil {
+			fp.CurrentDirectory = cwd
+		} else {
+			fp.CurrentDirectory = "."
+		}
+	} else {
+		fp.CurrentDirectory = homeDir
+	}
 
 	return model{
 		state:      stateConnecting,
@@ -173,7 +185,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 		case "enter":
-			return m.handleEnter()
+			// Don't intercept Enter key when in file select state
+			if m.state != stateFileSelect {
+				return m.handleEnter()
+			}
 		}
 
 	case connectMsg:
@@ -242,12 +257,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.profileList, cmd = m.profileList.Update(msg)
 		return m, cmd
 
+	// case stateFileSelect:
+	// 	var cmd tea.Cmd
+	// 	m.filepicker, cmd = m.filepicker.Update(msg)
+	// 	if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
+	// 		return m, m.processCSV(path)
+	// 	}
+	// 	return m, cmd
+	// }
 	case stateFileSelect:
 		var cmd tea.Cmd
-		m.filepicker, cmd = m.filepicker.Update(msg)
+
+		// Check for file selection first, before updating the filepicker
 		if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
+			m.state = stateProcessing
 			return m, m.processCSV(path)
 		}
+
+		m.filepicker, cmd = m.filepicker.Update(msg)
 		return m, cmd
 	}
 
@@ -278,6 +305,7 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		if item, ok := m.profileList.SelectedItem().(item); ok {
 			m.selectedProfile = item.id
 			m.state = stateFileSelect
+			// FIX: Return the file picker's Init command to properly initialize it
 			return m, m.filepicker.Init()
 		}
 	}
