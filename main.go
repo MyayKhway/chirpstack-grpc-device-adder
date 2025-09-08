@@ -136,7 +136,7 @@ func initialModel() model {
 		state:      stateConnecting,
 		tokenInput: ti,
 		filepicker: fp,
-		serverAddr: "localhost:8080", // Default ChirpStack gRPC address
+		serverAddr: "localhost:8081", // Default ChirpStack gRPC address
 		status:     "Enter your ChirpStack API token",
 		width:      80, // Default width
 		height:     24, // Default height
@@ -363,7 +363,6 @@ func (m model) loadDeviceProfiles() tea.Cmd {
 		if err != nil {
 			return errorMsg(err)
 		}
-
 		var items []item
 		for _, profile := range resp.Result {
 			items = append(items, item{
