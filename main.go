@@ -184,7 +184,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.client.Close()
 			}
 			return m, tea.Quit
-		case "enter":
+		case "enter", " ", "ctrl+m":
 			// Don't intercept Enter key when in file select state
 			if m.state != stateFileSelect {
 				return m.handleEnter()
@@ -305,7 +305,6 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		if item, ok := m.profileList.SelectedItem().(item); ok {
 			m.selectedProfile = item.id
 			m.state = stateFileSelect
-			// FIX: Return the file picker's Init command to properly initialize it
 			return m, m.filepicker.Init()
 		}
 	}
@@ -315,7 +314,7 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 
 func (m model) handleConnect() (tea.Model, tea.Cmd) {
 	// Connect to ChirpStack gRPC API using insecure connection (as per docker-compose config)
-	conn, err := grpc.Dial(m.serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(m.serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return m, func() tea.Msg {
 			return errorMsg(fmt.Errorf("failed to connect to ChirpStack at %s: %v\nMake sure ChirpStack gRPC API is running on this address", m.serverAddr, err))
@@ -457,6 +456,16 @@ func (m model) processCSV(filepath string) tea.Cmd {
 				log.Printf("Failed to create device %s: %v", devEui, err)
 			} else {
 				created++
+				_, err := m.deviceClient.CreateKeys(ctx, &api.CreateDeviceKeysRequest{
+					DeviceKeys: &api.DeviceKeys{
+						DevEui: devEui,
+						NwkKey: "5572404c696e6b4c6f52613230313823",
+					},
+				})
+				if err != nil {
+					// Log error but continue with other devices
+					log.Printf("Failed to create device key %s: %v", devEui, err)
+				}
 			}
 		}
 
