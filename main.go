@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -42,6 +44,7 @@ type state int
 
 const (
 	stateConnecting state = iota
+	stateModeSelect       // New: Choose between Device or Gateway
 	stateTenantSelect
 	stateApplicationSelect
 	stateDeviceProfileSelect
@@ -49,6 +52,14 @@ const (
 	stateProcessing
 	stateComplete
 	stateError
+)
+
+// Run mode
+type runMode int
+
+const (
+	modeDevices runMode = iota
+	modeGateways
 )
 
 // List item for selections
@@ -68,6 +79,7 @@ type model struct {
 	appClient     api.ApplicationServiceClient
 	deviceClient  api.DeviceServiceClient
 	profileClient api.DeviceProfileServiceClient
+	gatewayClient api.GatewayServiceClient // New: Gateway client
 
 	// API Token and server
 	apiToken   string
@@ -78,11 +90,13 @@ type model struct {
 	height int
 
 	// Selection lists
+	modeList    list.Model // New: Mode selection
 	tenantList  list.Model
 	appList     list.Model
 	profileList list.Model
 
 	// Selected items
+	runMode         runMode // New: Store whether we're adding devices or gateways
 	selectedTenant  string
 	selectedApp     string
 	selectedProfile string
@@ -98,7 +112,7 @@ type model struct {
 	err    error
 
 	// Results
-	devicesCreated int
+	itemsCreated int // Renamed from devicesCreated
 }
 
 // Messages
@@ -107,7 +121,7 @@ type (
 	tenantsLoadedMsg  []item
 	appsLoadedMsg     []item
 	profilesLoadedMsg []item
-	devicesCreatedMsg int
+	itemsCreatedMsg   int // Renamed from devicesCreatedMsg
 	errorMsg          error
 )
 
@@ -126,22 +140,21 @@ func initialModel() model {
 	ti.CharLimit = 256
 	ti.Width = 50
 	ti.EchoMode = textinput.EchoPassword
+	err := godotenv.Load()
+	if err == nil {
+		if token, ok := os.LookupEnv("TOKEN"); ok {
+			ti.SetValue(token)
+		}
+	}
 
 	// Initialize file picker
 	fp := filepicker.New()
 	fp.AllowedTypes = []string{".csv"}
 
-	// Set current directory with error handling
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		// Fallback to current directory if home directory fails
-		if cwd, err := os.Getwd(); err == nil {
-			fp.CurrentDirectory = cwd
-		} else {
-			fp.CurrentDirectory = "."
-		}
+	if cwd, err := os.Getwd(); err == nil {
+		fp.CurrentDirectory = cwd
 	} else {
-		fp.CurrentDirectory = homeDir
+		fp.CurrentDirectory = "."
 	}
 
 	return model{
@@ -164,16 +177,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		listHeight := msg.Height - 8
 
 		// Update list dimensions
+		if m.modeList.Items() != nil {
+			m.modeList.SetSize(msg.Width-4, listHeight)
+		}
 		if m.tenantList.Items() != nil {
-			m.tenantList.SetSize(msg.Width-4, msg.Height-8)
+			m.tenantList.SetSize(msg.Width-4, listHeight)
 		}
 		if m.appList.Items() != nil {
-			m.appList.SetSize(msg.Width-4, msg.Height-8)
+			m.appList.SetSize(msg.Width-4, listHeight)
 		}
 		if m.profileList.Items() != nil {
-			m.profileList.SetSize(msg.Width-4, msg.Height-8)
+			m.profileList.SetSize(msg.Width-4, listHeight)
 		}
 		return m, nil
 
@@ -224,8 +241,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateDeviceProfileSelect
 		return m, nil
 
-	case devicesCreatedMsg:
-		m.devicesCreated = int(msg)
+	case itemsCreatedMsg: // Renamed
+		m.itemsCreated = int(msg) // Renamed
 		m.state = stateComplete
 		return m, nil
 
@@ -240,6 +257,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case stateConnecting:
 		var cmd tea.Cmd
 		m.tokenInput, cmd = m.tokenInput.Update(msg)
+		return m, cmd
+
+	case stateModeSelect: // New
+		var cmd tea.Cmd
+		m.modeList, cmd = m.modeList.Update(msg)
 		return m, cmd
 
 	case stateTenantSelect:
@@ -257,21 +279,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.profileList, cmd = m.profileList.Update(msg)
 		return m, cmd
 
-	// case stateFileSelect:
-	// 	var cmd tea.Cmd
-	// 	m.filepicker, cmd = m.filepicker.Update(msg)
-	// 	if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
-	// 		return m, m.processCSV(path)
-	// 	}
-	// 	return m, cmd
-	// }
 	case stateFileSelect:
 		var cmd tea.Cmd
 
 		// Check for file selection first, before updating the filepicker
 		if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
 			m.state = stateProcessing
-			return m, m.processCSV(path)
+			// Branch based on mode
+			if m.runMode == modeDevices {
+				return m, m.processCSV(path)
+			} else {
+				return m, m.processGatewayCSV(path) // New function
+			}
 		}
 
 		m.filepicker, cmd = m.filepicker.Update(msg)
@@ -289,10 +308,27 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 			return m, func() tea.Msg { return connectMsg{} }
 		}
 
+	case stateModeSelect: // New
+		if item, ok := m.modeList.SelectedItem().(item); ok {
+			if item.title == "Add Devices" {
+				m.runMode = modeDevices
+			} else {
+				m.runMode = modeGateways
+			}
+			// Both modes need a tenant, so load tenants next
+			return m, m.loadTenants()
+		}
+
 	case stateTenantSelect:
 		if item, ok := m.tenantList.SelectedItem().(item); ok {
 			m.selectedTenant = item.id
-			return m, m.loadApplications()
+			// Branch logic: if devices, load apps. if gateways, go to file select.
+			if m.runMode == modeDevices {
+				return m, m.loadApplications()
+			} else {
+				m.state = stateFileSelect
+				return m, m.filepicker.Init()
+			}
 		}
 
 	case stateApplicationSelect:
@@ -312,12 +348,12 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) handleConnect() (tea.Model, tea.Cmd) {
-	// Connect to ChirpStack gRPC API using insecure connection (as per docker-compose config)
+func (m *model) handleConnect() (tea.Model, tea.Cmd) {
+	// Connect to ChirpStack gRPC API
 	conn, err := grpc.NewClient(m.serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return m, func() tea.Msg {
-			return errorMsg(fmt.Errorf("failed to connect to ChirpStack at %s: %v\nMake sure ChirpStack gRPC API is running on this address", m.serverAddr, err))
+			return errorMsg(fmt.Errorf("failed to connect to ChirpStack at %s: %v", m.serverAddr, err))
 		}
 	}
 
@@ -326,8 +362,18 @@ func (m model) handleConnect() (tea.Model, tea.Cmd) {
 	m.appClient = api.NewApplicationServiceClient(conn)
 	m.deviceClient = api.NewDeviceServiceClient(conn)
 	m.profileClient = api.NewDeviceProfileServiceClient(conn)
+	m.gatewayClient = api.NewGatewayServiceClient(conn) // New
 
-	return m, m.loadTenants()
+	// Create mode selection list
+	items := []list.Item{
+		item{title: "Add Devices", desc: "Bulk add devices from a CSV file"},
+		item{title: "Add Gateways", desc: "Bulk add gateways from a CSV file"},
+	}
+	m.modeList = list.New(items, list.NewDefaultDelegate(), m.width-4, m.height-8)
+	m.modeList.Title = "Select Operation"
+	m.state = stateModeSelect // Go to new mode select state
+
+	return m, nil
 }
 
 func (m model) loadTenants() tea.Cmd {
@@ -442,7 +488,7 @@ func (m model) processCSV(filepath string) tea.Cmd {
 			// Create device
 			_, err := m.deviceClient.Create(ctx, &api.CreateDeviceRequest{
 				Device: &api.Device{
-					DevEui:          devEui,
+					DevEui:          strings.ToLower(devEui),
 					Name:            name,
 					Description:     description,
 					ApplicationId:   m.selectedApp,
@@ -459,7 +505,7 @@ func (m model) processCSV(filepath string) tea.Cmd {
 				_, err := m.deviceClient.CreateKeys(ctx, &api.CreateDeviceKeysRequest{
 					DeviceKeys: &api.DeviceKeys{
 						DevEui: devEui,
-						NwkKey: "5572404c696e6b4c6f52613230313823",
+						NwkKey: "5572404c696e6b4c6f52613230313823", // Consider making this dynamic
 					},
 				})
 				if err != nil {
@@ -469,7 +515,63 @@ func (m model) processCSV(filepath string) tea.Cmd {
 			}
 		}
 
-		return devicesCreatedMsg(created)
+		return itemsCreatedMsg(created) // Renamed
+	}
+}
+
+// New function to process gateways
+func (m model) processGatewayCSV(filepath string) tea.Cmd {
+	return func() tea.Msg {
+		file, err := os.Open(filepath)
+		if err != nil {
+			return errorMsg(err)
+		}
+		defer file.Close()
+
+		reader := csv.NewReader(file)
+		records, err := reader.ReadAll()
+		if err != nil {
+			return errorMsg(err)
+		}
+
+		ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+m.apiToken))
+
+		created := 0
+		// Skip header row if exists
+		start := 0
+		if len(records) > 0 && !isHexString(records[0][0]) {
+			start = 1
+		}
+
+		for i := start; i < len(records); i++ {
+			record := records[i]
+			if len(record) < 2 {
+				continue // Skip invalid records (need at least EUI and name)
+			}
+
+			gatewayEui := record[0]
+			name := record[1]
+
+			// Create gateway
+			_, err := m.gatewayClient.Create(ctx, &api.CreateGatewayRequest{
+				Gateway: &api.Gateway{
+					GatewayId:     gatewayEui,
+					Name:          name,
+					TenantId:      m.selectedTenant,
+					Description:   "", // As requested
+					StatsInterval: 30, // As requested
+				},
+			})
+
+			if err != nil {
+				// Log error but continue with other gateways
+				log.Printf("Failed to create gateway %s: %v", gatewayEui, err)
+			} else {
+				created++
+			}
+		}
+
+		return itemsCreatedMsg(created) // Use renamed msg
 	}
 }
 
@@ -490,15 +592,23 @@ func (m model) View() string {
 	case stateConnecting:
 		return fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
-			titleStyle.Render("ChirpStack Device Manager"),
+			titleStyle.Render("ChirpStack Bulk Provisioner"),
 			m.tokenInput.View(),
 			helpStyle.Render("Press Enter to connect • Press q to quit"),
+		)
+
+	case stateModeSelect: // New View
+		return fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			titleStyle.Render("Select Operation"),
+			m.modeList.View(),
+			helpStyle.Render("↑/↓: navigate • Enter: select • q: quit"),
 		)
 
 	case stateTenantSelect:
 		return fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
-			titleStyle.Render("ChirpStack Device Manager"),
+			titleStyle.Render("Select Tenant"),
 			m.tenantList.View(),
 			helpStyle.Render("↑/↓: navigate • Enter: select • q: quit"),
 		)
@@ -506,7 +616,7 @@ func (m model) View() string {
 	case stateApplicationSelect:
 		return fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
-			titleStyle.Render("ChirpStack Device Manager"),
+			titleStyle.Render("Select Application"),
 			m.appList.View(),
 			helpStyle.Render("↑/↓: navigate • Enter: select • q: quit"),
 		)
@@ -514,31 +624,49 @@ func (m model) View() string {
 	case stateDeviceProfileSelect:
 		return fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
-			titleStyle.Render("ChirpStack Device Manager"),
+			titleStyle.Render("Select Device Profile"),
 			m.profileList.View(),
 			helpStyle.Render("↑/↓: navigate • Enter: select • q: quit"),
 		)
 
 	case stateFileSelect:
+		title := "Select CSV File" // Default
+		if m.runMode == modeDevices {
+			title = "Select Device CSV File"
+		} else {
+			title = "Select Gateway CSV File"
+		}
 		return fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
-			titleStyle.Render("Select CSV File"),
+			titleStyle.Render(title), // Dynamic title
 			m.filepicker.View(),
 			helpStyle.Render("Navigate and press Enter to select • Press q to quit"),
 		)
 
 	case stateProcessing:
+		itemType := "items"
+		if m.runMode == modeDevices {
+			itemType = "devices"
+		} else {
+			itemType = "gateways"
+		}
 		return fmt.Sprintf(
 			"%s\n\n%s",
 			titleStyle.Render("Processing..."),
-			statusStyle.Render("Creating devices from CSV file..."),
+			statusStyle.Render(fmt.Sprintf("Creating %s from CSV file...", itemType)), // Dynamic msg
 		)
 
 	case stateComplete:
+		itemType := "items"
+		if m.runMode == modeDevices {
+			itemType = "devices"
+		} else {
+			itemType = "gateways"
+		}
 		return fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
 			titleStyle.Render("Complete!"),
-			statusStyle.Render(fmt.Sprintf("Successfully created %d devices", m.devicesCreated)),
+			statusStyle.Render(fmt.Sprintf("Successfully created %d %s", m.itemsCreated, itemType)), // Dynamic msg
 			helpStyle.Render("Press q to quit"),
 		)
 
